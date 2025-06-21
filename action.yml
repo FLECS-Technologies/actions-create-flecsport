@@ -1,0 +1,306 @@
+name: Create FLECSport
+description: A GitHub action to create FLECSport compatible archives from FLECS Apps
+author: FLECS Technologies GmbH <info@flecs.tech>
+
+inputs:
+  app:
+    description: Name of the App in reverse domain name notation
+    type: string
+    required: true
+  version:
+    description: Version of the App
+    type: string
+    required: true
+  arch:
+    description: App architecture
+    type: string
+    default: amd64
+  x-session-id:
+    description: Valid Session ID to authenticate with FLECS Marketplace
+    type: string
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download App Manifest
+      id: download-app-manifest
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_X_SESSION_ID: ${{ inputs.x-session-id }}
+      run: |
+        curl --verbose --fail-with-body -H "X-Session-Id: ${INPUT_X_SESSION_ID}" \
+          https://console.flecs.tech/api/v2/manifests/${INPUT_APP}/${INPUT_VERSION} >response.json 2>http-headers || (cat http-headers; exit 1)
+        MANIFEST=$(cat response.json | jq -c '.data')
+        X_SESSION_ID=$(cat http-headers | sed -nE 's#< x-session-id: (.+$)#\1#p' | jq -rc '.id')
+        echo "manifest=${MANIFEST}" >> "$GITHUB_OUTPUT"
+        echo "x-session-id=${X_SESSION_ID}" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Print App Manifest
+      run: |
+        echo ${{ steps.download-app-manifest.outputs.manifest }}
+        echo ${{ steps.download-app-manifest.outputs.x-session-id }}
+      shell: bash
+
+    - name: Extract Docker image(s) from App Manifest
+      id: parse-images-from-manifest
+      env:
+        INPUT_MANIFEST: ${{ steps.download-app-manifest.outputs.manifest }}
+      run: |
+        COMPOSE_IMAGES=$(echo ${INPUT_MANIFEST} | jq -rc '.deployment | select(. != null) | .compose.yaml.services[].image')
+        COMPOSE_SERVICES=$(echo ${INPUT_MANIFEST} | jq -rc '.deployment | select(. != null) | .compose.yaml.services | keys[]')
+        DOCKER_IMAGES=$(echo ${INPUT_MANIFEST} | jq -rc '.image | select(. != null)')
+        if [ ! -z "${DOCKER_IMAGES}" ]; then
+          DOCKER_IMAGES=${DOCKER_IMAGES}:$(echo ${INPUT_MANIFEST} | jq -rc '.version')
+        fi
+        SERVICES="$(cat << EOF
+        ${COMPOSE_SERVICES}
+        EOF
+        )"
+        IMAGES="$(cat << EOF
+        ${COMPOSE_IMAGES}${DOCKER_IMAGES}
+        EOF
+        )"
+        SERVICES=$(echo -n "${SERVICES}" | jq -rc --raw-input --slurp 'split("\n")')
+        IMAGES=$(echo -n "${IMAGES}" | jq -rc --raw-input --slurp 'split("\n")')
+        echo "services=${SERVICES}" >> "$GITHUB_OUTPUT"
+        echo "images=${IMAGES}" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Print Docker image(s) from Manifest
+      run: |
+        echo ${{ steps.parse-images-from-manifest.outputs.images }}
+        echo ${{ steps.parse-images-from-manifest.outputs.services }}
+      shell: bash
+
+    - name: Create download token
+      id: create-download-token
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_X_SESSION_ID: ${{ steps.download-app-manifest.outputs.x-session-id }}
+      run: |
+        curl --verbose --fail-with-body -H "X-Session-Id: ${INPUT_X_SESSION_ID}" \
+          -d "{\"app\":\"${INPUT_APP}\",\"version\":\"${INPUT_VERSION}\"}" \
+          https://console.flecs.tech/api/v2/tokens >response.json 2>http-headers
+        USERNAME=$(cat response.json | jq -rc '.data.token.username')
+        PASSWORD=$(cat response.json | jq -rc '.data.token.password')
+        X_SESSION_ID=$(cat http-headers | sed -nE 's#< x-session-id: (.+$)#\1#p' | jq -rc '.id')
+        echo "username=${USERNAME}" >> "$GITHUB_OUTPUT"
+        echo "password=${PASSWORD}" >> "$GITHUB_OUTPUT"
+        echo "x-session-id=${X_SESSION_ID}" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Print download token
+      run: |
+        echo ${{ steps.create-download-token.outputs.username }}
+        echo ${{ steps.create-download-token.outputs.password }}
+        echo ${{ steps.create-download-token.outputs.x-session-id }}
+      shell: bash
+
+    - name: Login to FLECS container registry
+      uses: docker/login-action@v3
+      with:
+        registry: flecs.azurecr.io
+        username: ${{ steps.create-download-token.outputs.username }}
+        password: ${{ steps.create-download-token.outputs.password }}
+
+    - name: Transform architecture to Docker platform
+      id: arch-to-docker-platform
+      env:
+        INPUT_ARCH: ${{ inputs.arch }}
+      run: |
+        PLATFORM="unknown"
+        case "${INPUT_ARCH}" in
+          "amd64")
+            PLATFORM="linux/amd64"
+            ;;
+          "arm64")
+            PLATFORM="linux/arm64/v8"
+            ;;
+          "armhf")
+            PLATFORM="linux/arm/v7"
+            ;;
+          *)
+            echo "Unknown architecture ${INPUT_ARCH}" 1>&2
+            exit 1
+            ;;
+        esac
+        echo "platform=${PLATFORM}" >> "$GITHUB_OUTPUT"
+      shell: bash
+
+    - name: Print Docker platform
+      run: |
+        echo ${{ steps.arch-to-docker-platform.outputs.platform }}
+      shell: bash
+
+    - name: Pull Docker images
+      env:
+        INPUT_IMAGES: ${{ steps.parse-images-from-manifest.outputs.images }}
+        INPUT_PLATFORM: ${{ steps.arch-to-docker-platform.outputs.platform }}
+      run: |
+        echo "Pulling ${INPUT_IMAGES}"
+        echo "${INPUT_IMAGES}" | jq -rc '.[]' |
+        while IFS=$'\n' read -r image; do
+          echo docker pull --platform ${INPUT_PLATFORM} ${image}
+          docker pull --platform ${INPUT_PLATFORM} ${image} || exit 1
+        done
+      shell: bash
+
+    - name: Save Docker images
+      env:
+        INPUT_IMAGES: ${{ steps.parse-images-from-manifest.outputs.images }}
+        INPUT_PLATFORM: ${{ steps.arch-to-docker-platform.outputs.platform }}
+      run: |
+        echo "${INPUT_IMAGES}" | jq -rc '.[]' |
+        while IFS=$'\n' read -r image; do
+          FILENAME=$(echo "${image}" | tr '/' '_' | tr ':' '_')
+          docker save --output /tmp/${FILENAME}.tar ${image} --platform ${INPUT_PLATFORM} || exit 1
+        done
+      shell: bash
+
+    - name: Create FLECSport directory
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        mkdir -p /tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}
+      shell: bash
+
+    - name: Copy App Manifest to flecsport directory
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_MANIFEST: ${{ steps.download-app-manifest.outputs.manifest }}
+      run: |
+        echo "${INPUT_MANIFEST}" | jq >/tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}/${INPUT_APP}_${INPUT_VERSION}.manifest.json
+      shell: bash
+
+    - name: Print App Manifest
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        cat /tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}/${INPUT_APP}_${INPUT_VERSION}.manifest.json
+      shell: bash
+
+    - name: Create App deployment in flecsport directory
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_SERVICES: ${{ steps.parse-images-from-manifest.outputs.services }}
+      run: |
+        DEPLOYMENT=$(echo "{}" |
+          jq ".key += {\"name\":\"${INPUT_APP}\", \"version\":\"${INPUT_VERSION}\"}")
+        DEPLOYMENT=$(echo "${DEPLOYMENT}" | jq '.deployments += [{"desired":"Installed","deployment_id":""}]')
+        if [ "${INPUT_SERVICES}" == "[]" ]; then
+          DEPLOYMENT=$(echo "${DEPLOYMENT}" | jq '.deployments[0].deployment_id = "DefaultDockerDeployment"')
+        else
+          DEPLOYMENT=$(echo "${DEPLOYMENT}" | jq '.deployments[0].deployment_id = "DefaultComposeDeployment"')
+        fi
+        echo "${DEPLOYMENT}" | jq >/tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}/${INPUT_APP}_${INPUT_VERSION}.json
+      shell: bash
+
+    - name: Print App deployment
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        cat /tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}/${INPUT_APP}_${INPUT_VERSION}.json
+      shell: bash
+
+    - name: Copy Docker images to flecsport directory
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_IMAGES: ${{ steps.parse-images-from-manifest.outputs.images }}
+        INPUT_SERVICES: ${{ steps.parse-images-from-manifest.outputs.services }}
+      run: |
+        NUM_IMAGES=$(echo "${INPUT_IMAGES}" | jq '. | length')
+        NUM_SERVICES=$(echo "${INPUT_SERVICES}" | jq '. | length')
+        COUNTER=0
+        while [ ${COUNTER} -lt ${NUM_IMAGES} ]; do
+          IMAGE=$(echo "${INPUT_IMAGES}" | jq -rc ".[${COUNTER}]")
+          FROM_IMAGE=$(echo "${IMAGE}" | tr '/' '_' | tr ':' '_')
+          TO_IMAGE="/tmp/flecsport/apps/${INPUT_APP}_${INPUT_VERSION}/${INPUT_APP}_${INPUT_VERSION}"
+          if [ ${NUM_SERVICES} -gt 0 ]; then
+            SERVICE=$(echo "${INPUT_SERVICES}" | jq -rc ".[${COUNTER}]")
+            TO_IMAGE="${TO_IMAGE}.${SERVICE}.tar"
+          else
+            TO_IMAGE="${TO_IMAGE}.tar"
+          fi
+          cp "/tmp/${FROM_IMAGE}.tar" "${TO_IMAGE}"
+          COUNTER=$(( COUNTER + 1 ))
+        done
+      shell: bash
+
+    - name: Create flecsport manifest
+      env:
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_ARCH: ${{ inputs.arch }}
+      run: |
+        case "${INPUT_ARCH}" in
+          "amd64")
+            MACHINE="x86_64"
+            ;;
+          "arm64")
+            MACHINE="aarch64"
+            ;;
+          "armhf")
+            MACHINE="armv7l"
+            ;;
+          *)
+            echo "Invalid ARCH ${INPUT_ARCH}" 1>&2
+            exit 1
+        esac
+        NOW=$(date +%s:%N)
+        SECONDS=$(echo "${NOW}" | cut -f1 -d ':')
+        NANOS=$(echo "${NOW}" | cut -f2 -d ':')
+        M="{}"
+        M=$(echo "${M}" | jq '. += {"_schemaVersion":"3.0.0"}')
+        M=$(echo "${M}" | jq ". += {\"time\":{\"secs_since_epoch\":${SECONDS},\"nanos_since_epoch\":${NANOS}}}")
+        M=$(echo "${M}" | jq ".contents += {\"apps\":[{\"name\":\"${INPUT_APP}\",\"version\":\"${INPUT_VERSION}\"}]}")
+        M=$(echo "${M}" | jq ".contents += {\"instances\":[]}")
+        M=$(echo "${M}" | jq ".contents += {\"deployments\":[]}")
+        M=$(echo "${M}" | jq ".device += {\"sysinfo\":{\"arch\":\"${INPUT_ARCH}\"}}")
+        M=$(echo "${M}" | jq '.device.sysinfo += {"distro":{"codename":"bookworm","id":"debian","name":"Debian GNU/Linux 12 (bookworm)","version":"12"}}')
+        M=$(echo "${M}" | jq ".device.sysinfo += {\"kernel\":{\"build\":\"6.1.0-37-${INPUT_ARCH}\",\"machine\":\"${MACHINE}\",\"version\":\"#1 SMP PREEMPT_DYNAMIC Debian 6.1.140-1 (2025-05-22)\"}}")
+        M=$(echo "${M}" | jq '.device.sysinfo += {"platform":""}')
+        M=$(echo "${M}" | jq '.device += {"hostname":"flecs-workflow-automation"}')
+        M=$(echo "${M}" | jq '.version += {"core":"4.1.0-snowhare-auto","api":"2.1.0"}')
+        echo "${M}" | jq >/tmp/flecsport/manifest.json
+      shell: bash
+
+    - name: Print export manifest
+      run: |
+        cat /tmp/flecsport/manifest.json
+      shell: bash
+
+    - name: Create flecsport archive
+      env:
+        INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_APP: ${{ inputs.app }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        tar -cf flecs-export-${INPUT_APP}_${INPUT_VERSION}_${INPUT_ARCH}.tar -C /tmp/flecsport .
+        tar -tf flecs-export-${INPUT_APP}_${INPUT_VERSION}_${INPUT_ARCH}.tar
+        pwd
+        ls -la
+      shell: bash
+
+    - name: List flecsport directory content
+      run: |
+        ls -laR /tmp/flecsport
+      shell: bash
+
+    - name: Upload FLECSport artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: flecs-export-${{ inputs.app }}_${{ inputs.version }}_${{ inputs.arch }}
+        path: flecs-export-${{ inputs.app }}_${{ inputs.version }}_${{ inputs.arch }}.tar
+        if-no-files-found: error
+        retention-days: 1

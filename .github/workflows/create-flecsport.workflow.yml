@@ -1,0 +1,31 @@
+name: Create FLECSport
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Name of the App in reverse domain name notation
+        type: string
+        required: true
+      version:
+        description: Version of the App
+        type: string
+        required: true
+      x-session-id:
+        description: Valid Session ID to authenticate with FLECS Marketplace
+        type: string
+        required: true
+
+jobs:
+  create-flecsport:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Create FLECSport"
+        uses: ./
+        with:
+          app: ${{ inputs.app }}
+          version: ${{ inputs.version }}
+          x-session-id: ${{ inputs.x-session-id }}
